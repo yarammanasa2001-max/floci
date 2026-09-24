@@ -116,7 +116,7 @@ class RedshiftServerlessJsonHandlerTest {
 
     @Test
     void anUnknownActionIsReportedAsUnknownOperation() {
-        Response response = handler.handle("CreateWorkgroup", mapper.createObjectNode(), REGION);
+        Response response = handler.handle("CreateUsageLimit", mapper.createObjectNode(), REGION);
 
         assertEquals(400, response.getStatus());
         assertEquals("UnknownOperationException", errorType(response));

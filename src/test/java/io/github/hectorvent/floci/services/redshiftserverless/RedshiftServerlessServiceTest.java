@@ -6,6 +6,8 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.redshiftserverless.model.Namespace;
+import io.github.hectorvent.floci.services.redshiftserverless.model.RedshiftServerlessSnapshot;
+import io.github.hectorvent.floci.services.redshiftserverless.model.RedshiftServerlessWorkgroup;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -44,12 +46,17 @@ class RedshiftServerlessServiceTest {
         store = spy(AccountAwareStorageBackend.inMemory(ACCOUNT_ID));
         when(storageFactory.create(eq("redshiftserverless"), eq("redshiftserverless-namespaces.json"),
                 any(TypeReference.class))).thenReturn((AccountAwareStorageBackend) store);
+        when(storageFactory.create(eq("redshiftserverless"), eq("redshiftserverless-workgroups.json"),
+                any(TypeReference.class))).thenReturn(AccountAwareStorageBackend.inMemory(ACCOUNT_ID));
+        when(storageFactory.create(eq("redshiftserverless"), eq("redshiftserverless-snapshots.json"),
+                any(TypeReference.class))).thenReturn(AccountAwareStorageBackend.inMemory(ACCOUNT_ID));
 
         RegionResolver regionResolver = mock(RegionResolver.class);
         when(regionResolver.buildArn(eq("redshift-serverless"), any(String.class), any(String.class)))
                 .thenAnswer(invocation -> "arn:aws:redshift-serverless:"
                         + invocation.getArgument(1, String.class) + ":" + ACCOUNT_ID + ":"
                         + invocation.getArgument(2, String.class));
+        when(regionResolver.getAccountId()).thenReturn(ACCOUNT_ID);
         service = new RedshiftServerlessService(storageFactory, regionResolver);
     }
 
@@ -297,6 +304,122 @@ class RedshiftServerlessServiceTest {
         assertEquals(List.of("arn:aws:iam::123456789012:role/one"), original.getIamRoles());
         assertEquals(List.of("userlog"), original.getLogExports());
         assertEquals(Map.of("env", "dev"), original.getTags());
+    }
+
+    @Test
+    void createWorkgroupRequiresAnExistingNamespace() {
+        AwsException missing = assertThrows(AwsException.class,
+                () -> service.createWorkgroup(workgroup("orphan-wg", "no-such-ns"), REGION));
+        assertEquals("ResourceNotFoundException", missing.getErrorCode());
+    }
+
+    @Test
+    void createWorkgroupPublishesAnEndpointAndRejectsADuplicate() {
+        create("wg-ns");
+        RedshiftServerlessWorkgroup created = service.createWorkgroup(workgroup("wg-one", "wg-ns"), REGION);
+
+        assertEquals("AVAILABLE", created.getStatus());
+        assertEquals("arn:aws:redshift-serverless:us-east-1:" + ACCOUNT_ID + ":workgroup/" + created.getWorkgroupId(),
+                created.getWorkgroupArn());
+        assertEquals("wg-one." + ACCOUNT_ID + ".us-east-1.redshift-serverless.amazonaws.com",
+                created.getEndpointAddress());
+        assertEquals(5439, created.getEndpointPort());
+
+        AwsException conflict = assertThrows(AwsException.class,
+                () -> service.createWorkgroup(workgroup("wg-one", "wg-ns"), REGION));
+        assertEquals("ConflictException", conflict.getErrorCode());
+    }
+
+    @Test
+    void workgroupNamesAreScopedPerRegion() {
+        create("pair-ns");
+        service.createNamespace("pair-ns", "admin", null, null, null, null, null, Map.of(), "us-west-2");
+        service.createWorkgroup(workgroup("pair-wg", "pair-ns"), REGION);
+        service.createWorkgroup(workgroup("pair-wg", "pair-ns"), "us-west-2");
+
+        assertEquals(1, service.listWorkgroups(REGION, null, null).items().size());
+        assertEquals(1, service.listWorkgroups("us-west-2", null, null).items().size());
+    }
+
+    @Test
+    void updateWorkgroupAppliesOnlySuppliedFields() {
+        create("upd-ns");
+        RedshiftServerlessWorkgroup original = workgroup("upd-wg", "upd-ns");
+        original.setBaseCapacity(32);
+        service.createWorkgroup(original, REGION);
+
+        RedshiftServerlessWorkgroup patch = new RedshiftServerlessWorkgroup();
+        patch.setPort(5440);
+        RedshiftServerlessWorkgroup updated = service.updateWorkgroup("upd-wg", patch, REGION);
+
+        assertEquals(32, updated.getBaseCapacity());
+        assertEquals(5440, updated.getPort());
+        assertEquals(5440, updated.getEndpointPort());
+    }
+
+    @Test
+    void deleteWorkgroupReportsDeletingAndRemovesIt() {
+        create("del-ns");
+        service.createWorkgroup(workgroup("del-wg", "del-ns"), REGION);
+
+        assertEquals("DELETING", service.deleteWorkgroup("del-wg", REGION).getStatus());
+        AwsException missing = assertThrows(AwsException.class, () -> service.getWorkgroup("del-wg", REGION));
+        assertEquals("ResourceNotFoundException", missing.getErrorCode());
+    }
+
+    @Test
+    void workgroupsAreTaggableByArn() {
+        create("tag-ns");
+        RedshiftServerlessWorkgroup created = service.createWorkgroup(workgroup("tag-wg", "tag-ns"), REGION);
+
+        service.tagResource(created.getWorkgroupArn(), Map.of("env", "dev", "team", "data"), REGION);
+        service.untagResource(created.getWorkgroupArn(), List.of("team"), REGION);
+
+        assertEquals(Map.of("env", "dev"), service.listTagsForResource(created.getWorkgroupArn(), REGION));
+    }
+
+    @Test
+    void listSnapshotsFiltersByNamespace() {
+        create("snap-a");
+        create("snap-b");
+        RedshiftServerlessSnapshot snapshot = service.createSnapshot("snap-one", "snap-a", REGION);
+        service.createSnapshot("snap-two", "snap-b", REGION);
+
+        assertEquals("AVAILABLE", snapshot.getStatus());
+        assertEquals(ACCOUNT_ID, snapshot.getOwnerAccount());
+        assertEquals(List.of("snap-one"), service.listSnapshots("snap-a", REGION, null, null).items().stream()
+                .map(RedshiftServerlessSnapshot::getSnapshotName).toList());
+        assertEquals(2, service.listSnapshots(null, REGION, null, null).items().size());
+
+        AwsException conflict = assertThrows(AwsException.class,
+                () -> service.createSnapshot("snap-one", "snap-a", REGION));
+        assertEquals("ConflictException", conflict.getErrorCode());
+    }
+
+    @Test
+    void restoreRequiresAnExistingNamespaceWorkgroupAndSnapshot() {
+        create("restore-ns");
+        service.createSnapshot("restore-snap", "restore-ns", REGION);
+
+        AwsException noWorkgroup = assertThrows(AwsException.class,
+                () -> service.restoreFromSnapshot("restore-ns", "restore-wg", "restore-snap", REGION));
+        assertEquals("ResourceNotFoundException", noWorkgroup.getErrorCode());
+
+        service.createWorkgroup(workgroup("restore-wg", "restore-ns"), REGION);
+        Namespace restored = service.restoreFromSnapshot("restore-ns", "restore-wg", "restore-snap", REGION);
+        assertEquals("AVAILABLE", restored.getStatus());
+
+        AwsException noSnapshot = assertThrows(AwsException.class,
+                () -> service.restoreFromSnapshot("restore-ns", "restore-wg", "missing-snap", REGION));
+        assertEquals("ResourceNotFoundException", noSnapshot.getErrorCode());
+    }
+
+    private static RedshiftServerlessWorkgroup workgroup(String workgroupName, String namespaceName) {
+        RedshiftServerlessWorkgroup workgroup = new RedshiftServerlessWorkgroup();
+        workgroup.setWorkgroupName(workgroupName);
+        workgroup.setNamespaceName(namespaceName);
+        workgroup.setPort(null);
+        return workgroup;
     }
 
     private Namespace create(String namespaceName) {
